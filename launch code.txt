@@ -1,0 +1,216 @@
+$ErrorActionPreference = 'SilentlyContinue'
+
+$dest = "C:\GOG_Install_Files"
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+# Define the shortcut path (replace 'GameShortcut.lnk' with the actual shortcut name and adjust path if needed)
+$shortcutPath = "C:\GOG Games\Launch Fallout - New Vegas.lnk"
+
+function Get-OpticalDrive {
+    $drives = Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue
+    
+    foreach ($drive in $drives) {
+        $driveLetter = $drive.Name.TrimEnd(':')
+        try {
+            $vol = Get-Volume -DriveLetter $driveLetter -ErrorAction SilentlyContinue
+            if ($vol -and $vol.DriveType -eq 'CD-ROM' -and $vol.Size -gt 0) {
+                $root = "$($driveLetter):\"
+                return $root
+            }
+        } catch {
+        }
+    }
+    return $null
+}
+
+function Get-DiscLabel($drivePath) {
+    try {
+        $driveLetter = $drivePath.TrimEnd('\').TrimEnd(':')
+        $vol = Get-Volume -DriveLetter $driveLetter -ErrorAction SilentlyContinue
+        if ($vol) {
+            return $vol.FileSystemLabel
+        }
+    } catch { }
+    return "UnknownDisc"
+}
+
+function Copy-WithProgress($source, $destination, $discNumber) {
+    $files = Get-ChildItem -Path $source -Recurse -File -ErrorAction SilentlyContinue
+    $total = $files.Count
+    $count = 0
+
+    foreach ($file in $files) {
+        $count++
+        $percent = if ($total -gt 0) { [math]::Round(($count / $total) * 100, 0) } else { 0 }
+        Write-Progress -Activity "Copying Disc $discNumber" `
+                       -Status "$percent% complete" `
+                       -PercentComplete $percent `
+                       -CurrentOperation $file.FullName
+        $targetPath = Join-Path $destination ($file.FullName.Substring($source.Length))
+        New-Item -ItemType Directory -Force -Path (Split-Path $targetPath) -ErrorAction SilentlyContinue | Out-Null
+        Copy-Item $file.FullName $targetPath -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Progress -Activity "Copying Disc $discNumber" -Completed
+}
+
+if (-not (Test-Path $shortcutPath)) {
+    
+Write-Host "=== Auto Disc Copy for GOG Installers ==="
+Write-Host "Insert Disc 1 to begin. Press Q once all discs are copied."
+Write-Host "Destination: $dest`n"
+
+$lastDiscLabel = ""
+$discCount = 1
+$quit = $false
+
+while ($true) {
+    if ([Console]::KeyAvailable) {
+        $key = [Console]::ReadKey($true)
+        if ($key.Key -eq 'Q') { 
+            $quit = $true
+            break 
+        }
+    }
+
+    $drive = Get-OpticalDrive
+    if ($drive) {
+        $label = Get-DiscLabel $drive
+        
+        if ($label -and $label -ne $lastDiscLabel) {
+            Write-Host "`nDetected new disc: '$label' in drive $drive" -ForegroundColor Green
+            Copy-WithProgress $drive $dest $discCount
+            Write-Host "Disc $discCount copied successfully.`n" -ForegroundColor Green
+            $lastDiscLabel = $label
+            $discCount++
+            
+            Write-Host "Ejecting the Disc..." -ForegroundColor Yellow
+            $driveLetter = $drive.TrimEnd('\')
+            try {
+                (New-Object -ComObject Shell.Application).Namespace(17).ParseName($driveLetter).InvokeVerb("Eject")
+                Write-Host "Disc ejected." -ForegroundColor Yellow
+            } catch {
+                Write-Host "Could not eject disc automatically. Please eject manually." -ForegroundColor Red
+            }
+            
+            Write-Host "`n[!] Insert the next disc in the drive and close the tray." -ForegroundColor Yellow
+            Write-Host "[!] Press ENTER when ready to detect the next disc..." -ForegroundColor Cyan
+            Write-Host "(Or press 'Q' to end the copy and start the installation)" -ForegroundColor DarkGray
+            
+            $userInput = Read-Host
+            if ($userInput -eq 'q' -or $userInput -eq 'Q') { 
+                $quit = $true
+                break 
+            }
+            
+            $lastDiscLabel = ""
+            
+            Write-Host "`nWaiting for new disc to be recognized..." -ForegroundColor Gray
+            
+            $driveReady = $false
+            $maxAttempts = 60  # 60 attempts * 2 seconds = 2 minutes max
+            $attempts = 0
+            
+            while (-not $driveReady -and $attempts -lt $maxAttempts) {
+                $attempts++
+                
+                $progressChars = ".", "o", "O", "o"
+                $progressIndex = ($attempts % 4)
+                Write-Host "`rChecking for disc $($progressChars[$progressIndex])  (attempt $attempts/$maxAttempts)" -NoNewline -ForegroundColor Gray
+                
+                $currentDrive = Get-OpticalDrive
+                
+                if ($currentDrive) {
+                    $currentLabel = Get-DiscLabel $currentDrive
+                    Write-Host "`rFound drive: $currentDrive with label: '$currentLabel'    " -ForegroundColor Green
+                    
+                    if ($currentLabel -and $currentLabel -ne $label -and $currentLabel -ne "UnknownDisc") {
+                        $driveReady = $true
+                        Write-Host "`nNew disc detected: '$currentLabel' in drive $currentDrive" -ForegroundColor Green
+                        break
+                    } elseif ($currentLabel -eq $label) {
+                        Write-Host "`rStill seeing old disc '$label'. Please ensure the new disc is inserted.    " -ForegroundColor Yellow
+                    } elseif ($currentLabel -eq "UnknownDisc") {
+                        Write-Host "`rDisc detected but no label found. Attempting to read...    " -ForegroundColor Gray
+                    }
+                } else {
+                    if ($attempts % 5 -eq 0) {
+                        Write-Host "`rNo disc detected yet. Please check the drive.    " -ForegroundColor Yellow
+                    }
+                }
+                
+                Start-Sleep -Seconds 2
+            }
+            
+            Write-Host "`n"
+            
+            if (-not $driveReady) {
+                Write-Host "No new disc detected after waiting." -ForegroundColor Red
+                Write-Host "Options:" -ForegroundColor Yellow
+                Write-Host "  1. Press ENTER to try again" -ForegroundColor Cyan
+                Write-Host "  2. Press 'Q' to quit and run installer" -ForegroundColor Cyan
+                Write-Host "  3. Press 'M' to manually specify drive letter" -ForegroundColor Cyan
+                
+                $retryInput = Read-Host
+                if ($retryInput -eq 'q' -or $retryInput -eq 'Q') {
+                    $quit = $true
+                    break
+                } elseif ($retryInput -eq 'm' -or $retryInput -eq 'M') {
+                    Write-Host "Enter the drive letter for the disc (e.g., D):" -ForegroundColor Yellow
+                    $manualDrive = Read-Host
+                    if ($manualDrive) {
+                        $manualPath = "$($manualDrive):\"
+                        if (Test-Path $manualPath) {
+                            $manualLabel = Get-DiscLabel $manualPath
+                            if ($manualLabel -and $manualLabel -ne $label) {
+                                $driveReady = $true
+                                $drive = $manualPath
+                                $label = $manualLabel
+                                Write-Host "Using manual drive: $manualPath with label: '$manualLabel'" -ForegroundColor Green
+                            } else {
+                                Write-Host "Drive exists but may have old disc or no disc. Please try again." -ForegroundColor Red
+                            }
+                        } else {
+                            Write-Host "Drive letter not found. Please try again." -ForegroundColor Red
+                        }
+                    }
+                } else {
+                    $lastDiscLabel = ""
+                    continue
+                }
+            }
+            
+            if ($driveReady) {
+                continue
+            }
+        }
+    } else {
+        Write-Host "`rWaiting for drive with disc...     " -NoNewline -ForegroundColor Gray
+        Start-Sleep -Seconds 1
+    }
+}
+
+if ($quit) {
+    Write-Host "`nCopy process interrupted by user." -ForegroundColor Yellow
+    Write-Host "Total discs copied: $($discCount - 1)" -ForegroundColor Cyan
+}
+
+$installer = Get-ChildItem $dest -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -match "setup_.*\.exe" } |
+             Select-Object -First 1
+
+if ($installer) {
+    Write-Host "`nLaunching installer: $($installer.FullName)"
+    $process = Start-Process $installer.FullName -PassThru
+    $process.WaitForExit()
+
+    # Cleanup after installer finishes
+    Write-Host "Cleaning up installation files..."
+    Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "Cleanup complete."
+} else {
+    Write-Host "No GOG installer found in $dest."
+}
+} else {
+    Start-Process $shortcutPath
+}
